@@ -1,3 +1,5 @@
-websockets
+aiohttp
 requests
+flask
+websockets
 python-dotenv
