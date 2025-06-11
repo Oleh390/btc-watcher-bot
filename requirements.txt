@@ -1,5 +1,6 @@
-aiohttp
-requests
 websockets
+requests
 flask
 python-dotenv
+aiohttp
+asyncio
