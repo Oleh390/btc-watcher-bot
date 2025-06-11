@@ -110,8 +110,8 @@ async def handle_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         support_value = Decimal(support_price)
         sl = support_value * Decimal("0.995")
         tp = support_value * Decimal("1.005")
-        msg += f"\n\n📌 💡 <b>Торговая идея:</b>\n"
-        msg += f"<pre>Параметр         | Значение\n"
+        msg += f"\n\n📌 💡 <b> Торговая идея: </b>\n"
+        msg += f"Параметр         | Значение\n"
         msg += f"------------------|-------------------------------\n"
         msg += f"✅ Сценарий       | Лонг от поддержки {support_value - 25:.0f}–{support_value:.0f} $\n"
         msg += f"⛔ Стоп-лосс      | Ниже поддержки → {sl:.0f} $\n"
