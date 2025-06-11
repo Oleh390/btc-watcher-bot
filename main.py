@@ -92,8 +92,7 @@ async def handle_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"<b>🎯 Цель</b>         | <b>{support_value + 75:.0f}–{tp:.0f} $</b> (захват ликвидности)")
         lines.append(f"🔎 Доп. фильтр   | Подтверждение объёмом / свечой 1–5м</pre>")
 
-    await update.message.reply_text("
-".join(lines), parse_mode="HTML")
+    await update.message.reply_text("".join(lines), parse_mode="HTML")
 
 if __name__ == "__main__":
     app = Application.builder().token(TELEGRAM_TOKEN).build()
