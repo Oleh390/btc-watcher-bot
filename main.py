@@ -1,127 +1,130 @@
-
+import asyncio
+import json
+import math
 import os
+import websockets
+import requests
+from datetime import datetime
 from decimal import Decimal
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import aiohttp
-
-load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-symbol = "BTCUSDT"
+TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
+SYMBOL = "btcusdt"
 
-depth_levels = {
-    "±0.2%": 0.002,
-    "±2%": 0.02,
-    "±4%": 0.04,
-    "±10%": 0.10
-}
+DEPTH_LIMIT = 1000
+PRICE_LEVELS = [0.002, 0.004, 0.02, 0.04]  # ±0.2%, ±0.4%, ±2%, ±4%
 
-async def fetch_order_book(session):
-    url = f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=1000"
-    async with session.get(url) as response:
-        return await response.json()
+def send_telegram_message(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_USER_ID, "text": message, "parse_mode": "HTML"}
+    requests.post(url, json=payload)
 
-def calculate_stats(data, price, depth_pct):
-    bids = [(Decimal(p), Decimal(q)) for p, q in data['bids']]
-    asks = [(Decimal(p), Decimal(q)) for p, q in data['asks']]
+def format_number(n):
+    return f"{n:,.2f}".replace(",", " ")
 
-    lower = price * (Decimal("1") - depth_pct)
-    upper = price * (Decimal("1") + depth_pct)
+def get_aggregated_volume(levels, price, is_bid, depth):
+    total_volume = 0
+    best_price = 0
+    filtered = []
 
-    filtered_bids = [(p, q) for p, q in bids if lower <= p <= upper]
-    filtered_asks = [(p, q) for p, q in asks if lower <= p <= upper]
+    for p_str, qty_str in levels:
+        p = float(p_str)
+        if is_bid and price * (1 - depth) <= p <= price:
+            filtered.append((p, float(qty_str)))
+        elif not is_bid and price <= p <= price * (1 + depth):
+            filtered.append((p, float(qty_str)))
 
-    buy_volume = sum(p * q for p, q in filtered_bids)
-    sell_volume = sum(p * q for p, q in filtered_asks)
+    if filtered:
+        best_price, best_qty = max(filtered, key=lambda x: x[1]) if not is_bid else min(filtered, key=lambda x: x[1])
+        total_volume = sum(q for _, q in filtered)
+    return best_price, total_volume, filtered
 
-    buy_btc = sum(q for _, q in filtered_bids)
-    sell_btc = sum(q for _, q in filtered_asks)
+def get_depth_stats(levels, price, depth, is_bid):
+    min_price = price * (1 - depth)
+    max_price = price * (1 + depth)
+    levels_filtered = [(float(p), float(q)) for p, q in levels if min_price <= float(p) <= max_price]
+    if not levels_filtered:
+        return 0, 0, 0, 0.0
 
-    # Плотнейшие уровни по BTC
-    support_level = max(filtered_bids, key=lambda x: x[1], default=(Decimal("0"), Decimal("0")))
-    resistance_level = max(filtered_asks, key=lambda x: x[1], default=(Decimal("0"), Decimal("0")))
-
-    support_price, support_btc = support_level
-    resistance_price, resistance_btc = resistance_level
-
-    dominance = (buy_volume - sell_volume) / (buy_volume + sell_volume + Decimal("0.0001")) * 100
-    side = "🟢 Покупатели доминируют" if dominance > 0 else "🔴 Продавцы доминируют"
-    emoji = "🟢" if dominance > 0 else "🔴"
-
-    return {
-        "range": f"{int(depth_pct * 100)}%",
-        "support": f"{support_price:.2f} $ ({support_btc:.0f} BTC)",
-        "resistance": f"{resistance_price:.2f} $ ({resistance_btc:.0f} BTC)",
-        "side": f"{side} на {abs(dominance):.0f}%",
-        "emoji": emoji,
-        "buy_btc": f"{buy_btc:.2f}",
-        "sell_btc": f"{sell_btc:.2f}",
-        "buy_usd": f"{buy_volume:.0f}",
-        "sell_usd": f"{sell_volume:.0f}",
-        "bid_levels": len(filtered_bids),
-        "ask_levels": len(filtered_asks),
-        "lower": f"{lower:.2f}",
-        "upper": f"{upper:.2f}"
-    }
-
-def generate_summary(stats_by_range):
-    bullish = sum(1 for stats in stats_by_range.values() if "Покупатели" in stats["side"])
-    bearish = sum(1 for stats in stats_by_range.values() if "Продавцы" in stats["side"])
-
-    if bullish > bearish:
-        return "Объём лимитных заявок на покупку преобладает на большинстве уровней, возможен рост."
-    elif bearish > bullish:
-        return "Продавцы преобладают на ключевых уровнях, возможен откат или падение."
+    total_btc = sum(q for _, q in levels_filtered)
+    total_usdt = sum(p * q for p, q in levels_filtered)
+    level_count = len(levels_filtered)
+    if is_bid:
+        support_price = max(levels_filtered, key=lambda x: x[1])[0]
+        support_qty = max(levels_filtered, key=lambda x: x[1])[1]
+        return support_price, support_qty, level_count, total_btc, total_usdt
     else:
-        return "Баланс между покупателями и продавцами — рынок нейтрален."
+        resist_price = min(levels_filtered, key=lambda x: x[1])[0]
+        resist_qty = min(levels_filtered, key=lambda x: x[1])[1]
+        return resist_price, resist_qty, level_count, total_btc, total_usdt
 
-async def handle_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with aiohttp.ClientSession() as session:
-        data = await fetch_order_book(session)
-        price_data = await session.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}")
-        price = Decimal((await price_data.json())['price'])
+async def main():
+    url = f"wss://stream.binance.com:9443/ws/{SYMBOL}@depth@100ms"
+    async with websockets.connect(url) as ws:
+        while True:
+            response = await ws.recv()
+            data = json.loads(response)
 
-        stats_by_range = {}
-        for label, pct in depth_levels.items():
-            stats_by_range[label] = calculate_stats(data, price, Decimal(str(pct)))
+            bids = data.get("bids", [])[:DEPTH_LIMIT]
+            asks = data.get("asks", [])[:DEPTH_LIMIT]
 
-        msg = f"📊 BTC/USDT Order Book\n"
-        for label in depth_levels.keys():
-            stats = stats_by_range[label]
-            msg += (
-                f"\n🔵 ±{label}"
-                f"\n📉 Сопротивление: {stats['resistance']}"
-                f"\n📊 Поддержка: {stats['support']}"
-                f"\n📈 Диапазон: {stats['lower']} — {stats['upper']}"
-                f"\n🟥 ask уровней: {stats['ask_levels']} | 🟩 bid уровней: {stats['bid_levels']}"
-                f"\n💰 Объём: 🔻 {stats['sell_btc']} BTC / ${stats['sell_usd']} | 🔺 {stats['buy_btc']} BTC / ${stats['buy_usd']}"
-                f"\n{stats['emoji']} {stats['side']}\n"
+            if not bids or not asks:
+                continue
+
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            mark_price = (best_bid + best_ask) / 2
+
+            message = f"<b>📊 BTC/USDT Order Book</b>\n"
+            idea_support = ""
+            idea_resist = ""
+
+            for depth in PRICE_LEVELS:
+                resist_price, resist_qty, ask_levels, ask_btc, ask_usdt = get_depth_stats(asks, mark_price, depth, is_bid=False)
+                support_price, support_qty, bid_levels, bid_btc, bid_usdt = get_depth_stats(bids, mark_price, depth, is_bid=True)
+
+                if resist_price == 0 or support_price == 0:
+                    continue
+
+                total = ask_btc + bid_btc
+                dominance = (bid_btc - ask_btc) / total * 100 if total > 0 else 0
+                dom_str = f"🟢 Покупатели доминируют на {round(abs(dominance))}%"
+                if dominance < 0:
+                    dom_str = f"🔴 Продавцы доминируют на {round(abs(dominance))}%"
+
+                depth_percent = f"{int(depth * 1000)/10:.1f}%"
+
+                message += (
+                    f"\n🔵 ±{depth_percent}\n"
+                    f"📉 Сопротивление: {format_number(resist_price)} $ ({int(resist_qty)} BTC)\n"
+                    f"📊 Поддержка: {format_number(support_price)} $ ({int(support_qty)} BTC)\n"
+                    f"📈 Диапазон: {format_number(mark_price * (1 - depth))} — {format_number(mark_price * (1 + depth))}\n"
+                    f"🟥 ask уровней: {ask_levels} | 🟩 bid уровней: {bid_levels}\n"
+                    f"💰 Объём: 🔻 {format_number(ask_btc)} BTC / ${format_number(ask_usdt)} | 🔺 {format_number(bid_btc)} BTC / ${format_number(bid_usdt)}\n"
+                    f"{dom_str}\n"
+                )
+
+                # Для идеи используем ±0.2%
+                if depth == 0.002:
+                    idea_support = f"{format_number(support_price - 25)}–{format_number(support_price)} $"
+                    idea_resist = f"{format_number(resist_price + 50)}–{format_number(resist_price + 100)} $"
+                    stop_loss = f"{format_number(support_price - 500)} $"
+
+            message += "\n🧭 <b>Сводка:</b>\nОбъём лимитных заявок на покупку преобладает на большинстве уровней, возможен рост.\n"
+
+            message += (
+                "\n📌 💡 <b>Торговая идея:</b>\n"
+                "<pre>Параметр         | Значение\n"
+                "------------------|-------------------------------\n"
+                f"<b>✅ Сценарий       | Лонг от поддержки {idea_support}</b>\n"
+                f"⛔ Стоп-лосс      | Ниже поддержки → {stop_loss}\n"
+                f"<b>🎯 Цель           | {idea_resist} (захват ликвидности)</b>\n"
+                "🔎 Доп. фильтр    | Подтверждение объёмом / свечой 1–5м\n"
+                "</pre>"
             )
 
-        
-    msg += f"\n🧭 Сводка:\n{generate_summary(stats_by_range)}"
-
-    # Генерация торговой идеи при доминировании покупателей
-    main_range = stats_by_range["±0.2%"]
-    if "Покупатели" in main_range["side"]:
-        support_price = main_range["support"].split(" $")[0]
-        support_value = Decimal(support_price)
-        sl = support_value * Decimal("0.995")
-        tp = support_value * Decimal("1.005")
-        msg += f"\n\n📌 💡 <b>Торговая идея:</b>\n"
-        msg += f"<pre>Параметр         | Значение\n"
-        msg += f"------------------|-------------------------------\n"
-        msg += f"✅ Сценарий       | Лонг от поддержки {support_value - 25:.0f}–{support_value:.0f} $\n"
-        msg += f"⛔ Стоп-лосс      | Ниже поддержки → {sl:.0f} $\n"
-        msg += f"🎯 Цель           | {tp:.0f}–{tp + 500:.0f} $ (захват ликвидности)\n"
-        msg += f"🔎 Доп. фильтр    | Подтверждение объёмом / свечой 1–5м\n</pre>"
-    
-
-        await update.message.reply_text(msg)
+            send_telegram_message(message)
+            await asyncio.sleep(60)
 
 if __name__ == "__main__":
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("watch", handle_watch))
-    app.run_polling()
+    asyncio.run(main())
