@@ -20,19 +20,17 @@ async def send_news():
 async def news_command(update: Update, context):
     await send_news()
 
-app = ApplicationBuilder().token(TOKEN).build()
-app.add_handler(CommandHandler("news", news_command))
-
-async def scheduler():
+async def run_scheduler():
     while True:
         await send_news()
         await asyncio.sleep(600)  # 10 минут
 
-async def main():
-    await asyncio.gather(
-        app.run_polling(),
-        scheduler()
-    )
-
 if __name__ == '__main__':
-    asyncio.run(main())
+    app = ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("news", news_command))
+
+    # Запускаем планировщик в фоне
+    asyncio.create_task(run_scheduler())
+
+    # Запускаем самого бота (главный цикл)
+    app.run_polling()
