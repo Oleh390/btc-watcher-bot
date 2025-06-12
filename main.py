@@ -1,51 +1,55 @@
 import asyncio
-from decimal import Decimal
-from binance import AsyncClient
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 import os
+from decimal import Decimal
+from dotenv import load_dotenv
+from binance import AsyncClient
+from telegram import Bot
+from telegram.constants import ParseMode
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_USER_ID = int(os.getenv('TELEGRAM_USER_ID'))
+load_dotenv()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_USER_ID")
 
-SYMBOL = 'BTCUSDT'
-DEPTH_LEVELS = [
-    ("±0.2%", 0.2),
-    ("±0.4%", 0.4),
-    ("±2%", 2),
-    ("±4%", 4),
+PAIR = "BTCUSDT"
+
+INTERVALS = [
+    (0.2, "±0.2%"),
+    (0.4, "±0.4%"),
+    (2, "±2%"),
+    (4, "±4%"),
 ]
 
-def fmt(n):
-    # Форматирование чисел с пробелами
-    return '{:,.2f}'.format(float(n)).replace(',', ' ').replace('.00', '')
+async def get_order_book():
+    async with AsyncClient() as client:
+        depth = await client.get_order_book(symbol=PAIR, limit=1000)
+        bids = [(float(price), float(amount)) for price, amount in depth["bids"]]
+        asks = [(float(price), float(amount)) for price, amount in depth["asks"]]
+        return bids, asks
 
-def calc_levels(order_book, mid_price, percent):
-    # Границы диапазона
-    rng = (mid_price * (1 - percent / 100), mid_price * (1 + percent / 100))
-    # asks: выше mid_price, bids: ниже mid_price
-    asks = [(float(p), float(q)) for p, q in order_book['asks'] if rng[0] < float(p) <= rng[1]]
-    bids = [(float(p), float(q)) for p, q in order_book['bids'] if rng[0] <= float(p) < rng[1]]
+def calc_levels(bids, asks, mid_price, percent):
+    lower = mid_price * (1 - percent / 100)
+    upper = mid_price * (1 + percent / 100)
 
-    # Лимитные уровни и объёмы
-    ask_count = len(asks)
-    bid_count = len(bids)
-    ask_volume = sum(q for p, q in asks)
-    bid_volume = sum(q for p, q in bids)
-    ask_money = sum(p * q for p, q in asks)
-    bid_money = sum(p * q for p, q in bids)
+    # asks — только цены ВЫШЕ mid_price
+    asks_in_range = [(p, q) for p, q in asks if lower < p <= upper]
+    bids_in_range = [(p, q) for p, q in bids if lower <= p < upper]
 
-    # Сопротивление: max ask, Поддержка: min bid
-    resistance = max(asks, default=(mid_price, 0))
-    support = min(bids, default=(mid_price, 0))
+    ask_count = len(asks_in_range)
+    bid_count = len(bids_in_range)
+    ask_volume = sum(q for p, q in asks_in_range)
+    bid_volume = sum(q for p, q in bids_in_range)
+    ask_money = sum(p * q for p, q in asks_in_range)
+    bid_money = sum(p * q for p, q in bids_in_range)
 
-    # Диапазон
-    rng_min = min([p for p, q in bids + asks], default=mid_price)
-    rng_max = max([p for p, q in bids + asks], default=mid_price)
+    # Поддержка: bid с макс. объемом, Сопротивление: ask с макс. объемом
+    support = max(bids_in_range, key=lambda x: x[1], default=(0, 0))
+    resistance = max(asks_in_range, key=lambda x: x[1], default=(0, 0))
 
-    # Кто доминирует?
-    side = 'Покупатели' if bid_volume > ask_volume else 'Продавцы'
-    dom_pct = abs(bid_volume - ask_volume) / max(bid_volume + ask_volume, 1e-8) * 100
+    rng_min = min([p for p, _ in bids_in_range + asks_in_range], default=mid_price)
+    rng_max = max([p for p, _ in bids_in_range + asks_in_range], default=mid_price)
+
+    side = "Покупатели" if bid_volume > ask_volume else "Продавцы"
+    dom_pct = int(abs(bid_volume - ask_volume) / max(bid_volume + ask_volume, 1e-8) * 100)
 
     return {
         "support": support,
@@ -62,85 +66,55 @@ def calc_levels(order_book, mid_price, percent):
         "dom_pct": dom_pct,
     }
 
-def get_trade_idea(stats):
-    # Торговая идея по доминирующей стороне (±0.2%)
-    s = stats["±0.2%"]
-    side = s["side"]
-    support_price = s["support"][0]
-    resistance_price = s["resistance"][0]
-    entry_range = ""
-    stop_loss = ""
-    take_profit = ""
-    if side == "Покупатели":
-        entry_range = f"Лонг от поддержки {fmt(support_price-25)}–{fmt(support_price)} $"
-        stop_loss = f"Ниже поддержки → {fmt(support_price-50)} $"
-        take_profit = f"{fmt(support_price)}–{fmt(support_price+550)} $ (захват ликвидности)"
-    else:
-        entry_range = f"Шорт от сопротивления {fmt(resistance_price)}–{fmt(resistance_price+25)} $"
-        stop_loss = f"Выше сопротивления → {fmt(resistance_price+50)} $"
-        take_profit = f"{fmt(resistance_price-550)}–{fmt(resistance_price)} $ (захват ликвидности)"
+def format_num(n, nd=2):
+    if n is None: return "—"
+    if abs(n) >= 10000:
+        return f"{n:,.0f}".replace(",", " ")
+    return f"{n:,.{nd}f}"
 
-    return (
-        "📌 💡 <b>Торговая идея:</b>\n"
-        "<pre>Параметр       | Значение\n"
-        "--------------|------------------------------------\n"
-        f"✅ Сценарий    | {entry_range}\n"
-        f"⛔️ Стоп-лосс   | {stop_loss}\n"
-        f"🎯 Цель        | {take_profit}\n"
-        f"🔎 Доп. фильтр | Подтверждение объёмом / свечой 1–5м\n"
+def build_message(levels, mid_price):
+    lines = ["📊 BTC/USDT Order Book\n"]
+    for i, (pct, label) in enumerate(INTERVALS):
+        stats = levels[i]
+        lines.append(
+            f"🔵 {label}\n"
+            f"📉 Сопротивление: {format_num(stats['resistance'][0])} $ ({format_num(stats['resistance'][1], 0)} BTC)"
+            f"\n📊 Поддержка: {format_num(stats['support'][0])} $ ({format_num(stats['support'][1], 0)} BTC)"
+            f"\n📈 Диапазон: {format_num(stats['rng_min'])} — {format_num(stats['rng_max'])}"
+            f"\n🟥 ask уровней: {stats['ask_count']} | 🟩 bid уровней: {stats['bid_count']}"
+            f"\n💰 Объём: 🔻 {format_num(stats['ask_volume'], 2)} BTC / ${format_num(stats['ask_money'], 0)}"
+            f" | 🔺 {format_num(stats['bid_volume'], 2)} BTC / ${format_num(stats['bid_money'], 0)}"
+            f"\n🟢 Покупатели доминируют на {stats['dom_pct']}%" if stats["side"] == "Покупатели"
+            else f"\n🔴 Продавцы доминируют на {stats['dom_pct']}%"
+        )
+        lines.append("")  # Пустая строка для разделения
+
+    # Торговая идея — по самой первой поддержке/сопротивлению
+    idea = (
+        "\n📌 💡 <b>Торговая идея:</b>\n"
+        "<pre>Параметр         | Значение\n"
+        "------------------|-------------------------------\n"
+        f"✅ Сценарий       | Лонг от поддержки {format_num(levels[0]['support'][0]-25)}–{format_num(levels[0]['support'][0])} $\n"
+        f"⛔️ Стоп-лосс      | Ниже поддержки → {format_num(levels[0]['support'][0]-50)} $\n"
+        f"🎯 Цель           | {format_num(levels[0]['support'][0])}–{format_num(levels[0]['support'][0]+550)} $ (захват ликвидности)\n"
+        f"🔎 Доп. фильтр    | Подтверждение объёмом / свечой 1–5м\n"
         "</pre>"
     )
+    lines.append(idea)
+    return "\n".join(lines)
 
-async def get_order_book():
-    client = await AsyncClient.create()
-    depth = await client.get_order_book(symbol=SYMBOL, limit=1000)
-    await client.close_connection()
-    # bids/asks: [(price, qty)]
-    depth['bids'] = [(price, qty) for price, qty in depth['bids']]
-    depth['asks'] = [(price, qty) for price, qty in depth['asks']]
-    return depth
+async def main():
+    bot = Bot(token=TELEGRAM_TOKEN)
+    bids, asks = await get_order_book()
+    mid_price = (asks[0][0] + bids[0][0]) / 2
 
-async def handle_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Получить order book
-    order_book = await get_order_book()
-    all_prices = [float(p) for p, q in order_book['bids'] + order_book['asks']]
-    mid_price = sum(all_prices) / len(all_prices) if all_prices else 0
+    levels = []
+    for pct, _ in INTERVALS:
+        stats = calc_levels(bids, asks, mid_price, pct)
+        levels.append(stats)
 
-    stats = {}
-    for label, pct in DEPTH_LEVELS:
-        stats[label] = calc_levels(order_book, mid_price, pct)
-
-    # Формируем текст
-    lines = ["<b>📊 BTC/USDT Order Book</b>"]
-    for label, pct in DEPTH_LEVELS:
-        s = stats[label]
-        lines.append(f"\n🔵 {label}")
-        lines.append(
-            f"📉 Сопротивление: {fmt(s['resistance'][0])} $ ({fmt(s['resistance'][1])} BTC)"
-        )
-        lines.append(
-            f"📊 Поддержка: {fmt(s['support'][0])} $ ({fmt(s['support'][1])} BTC)"
-        )
-        lines.append(
-            f"📈 Диапазон: {fmt(s['rng_min'])} — {fmt(s['rng_max'])}"
-        )
-        lines.append(
-            f"🟥 ask уровней: {s['ask_count']} | 🟩 bid уровней: {s['bid_count']}"
-        )
-        lines.append(
-            f"💰 Объём: 🔻 {fmt(s['ask_volume'])} BTC / ${fmt(s['ask_money'])} | 🔺 {fmt(s['bid_volume'])} BTC / ${fmt(s['bid_money'])}"
-        )
-        dom_emoji = "🟢" if s['side'] == "Покупатели" else "🔴"
-        lines.append(
-            f"{dom_emoji*2} {s['side']} доминируют на {int(s['dom_pct'])}%"
-        )
-
-    # Добавить торговую идею по доминирующей стороне (±0.2%)
-    lines.append("\n" + get_trade_idea(stats))
-
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    message = build_message(levels, mid_price)
+    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode=ParseMode.HTML)
 
 if __name__ == "__main__":
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("watch", handle_watch))
-    app.run_polling()
+    asyncio.run(main())
