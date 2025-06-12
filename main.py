@@ -1,97 +1,49 @@
-import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-from binance.client import Client
 from decimal import Decimal
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-USER_ID = int(os.environ.get("TELEGRAM_USER_ID"))
-BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
-BINANCE_API_SECRET = os.environ.get("BINANCE_API_SECRET", "")
-client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+def get_orderbook_stats(symbol, pct=0.005):
+    # Получаем данные стакана через Binance API
+    from binance.client import Client
+    import os
 
-PCT = 0.005  # 0.5%
-
-def get_orderbook_stats(symbol="BTCUSDT", pct=0.005):
+    client = Client(api_key=os.getenv("BINANCE_API_KEY"), api_secret=os.getenv("BINANCE_API_SECRET"))
     depth = client.get_order_book(symbol=symbol, limit=1000)
-    bids = [(Decimal(price), Decimal(qty)) for price, qty in depth["bids"]]
-    asks = [(Decimal(price), Decimal(qty)) for price, qty in depth["asks"]]
-    mid_price = float((bids[0][0] + asks[0][0]) / 2) if bids and asks else 0
 
-    upper = mid_price * (1 + Decimal(pct))
-    lower = mid_price * (1 - Decimal(pct))
+    bids = [(Decimal(price), Decimal(amount)) for price, amount in depth['bids']]
+    asks = [(Decimal(price), Decimal(amount)) for price, amount in depth['asks']]
 
-    ask_within = [(p, q) for p, q in asks if p <= upper]
-    bid_within = [(p, q) for p, q in bids if p >= lower]
+    # Средняя рыночная цена (mid price)
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    mid_price = (best_bid + best_ask) / Decimal("2")
 
-    bid_vol = sum(q for p, q in bid_within)
-    ask_vol = sum(q for p, q in ask_within)
+    # Границы диапазона (с конвертацией типов!)
+    pct = Decimal(str(pct))  # если передаётся как float
+    upper = mid_price * (Decimal("1") + pct)
+    lower = mid_price * (Decimal("1") - pct)
 
-    res = {
-        "resistance": float(max(ask_within, default=(0, 0))[0]) if ask_within else None,
-        "resistance_qty": float(sum(q for p, q in ask_within)),
-        "support": float(min(bid_within, default=(0, 0))[0]) if bid_within else None,
-        "support_qty": float(sum(q for p, q in bid_within)),
-        "range_low": float(min(bid_within, default=(mid_price,))[0]) if bid_within else mid_price,
-        "range_high": float(max(ask_within, default=(mid_price,))[0]) if ask_within else mid_price,
-        "ask_lvls": len(ask_within),
-        "bid_lvls": len(bid_within),
-        "ask_vol": float(ask_vol),
-        "bid_vol": float(bid_vol),
-        "ask_usd": float(sum(p*q for p, q in ask_within)),
-        "bid_usd": float(sum(p*q for p, q in bid_within)),
-        "side": "Покупатели" if bid_vol > ask_vol else "Продавцы",
-        "side_pct": abs(bid_vol - ask_vol) / max(bid_vol, 1) * 100,
-        "mid_price": mid_price
+    # Фильтрация по диапазону
+    bids_in_range = [(price, qty) for price, qty in bids if lower <= price <= mid_price]
+    asks_in_range = [(price, qty) for price, qty in asks if mid_price <= price <= upper]
+
+    # Подсчёт объёмов и количества уровней
+    bid_volume = sum(qty for _, qty in bids_in_range)
+    ask_volume = sum(qty for _, qty in asks_in_range)
+    bid_levels = len(bids_in_range)
+    ask_levels = len(asks_in_range)
+
+    # Пример возвращаемых данных
+    return {
+        "mid_price": float(mid_price),
+        "lower": float(lower),
+        "upper": float(upper),
+        "bid_volume": float(bid_volume),
+        "ask_volume": float(ask_volume),
+        "bid_levels": bid_levels,
+        "ask_levels": ask_levels,
+        "top_bid": float(bids_in_range[0][0]) if bid_levels > 0 else None,
+        "top_ask": float(asks_in_range[0][0]) if ask_levels > 0 else None,
     }
-    return res
 
-def make_message(stats, symbol="BTCUSDT"):
-    asset = symbol.replace("USDT", "")
-    msg = (
-        f"📊 {asset}/USDT Order Book (±0.5%)\n"
-        f"Цена: {stats['mid_price']:.2f} $\n\n"
-        f"📉 Сопротивление: {stats['resistance']:.2f} $ ({stats['resistance_qty']:.2f} {asset})\n"
-        f"📊 Поддержка: {stats['support']:.2f} $ ({stats['support_qty']:.2f} {asset})\n"
-        f"📈 Диапазон: {stats['range_low']:.2f} — {stats['range_high']:.2f}\n"
-        f"🟥 ask уровней: {stats['ask_lvls']} | 🟩 bid уровней: {stats['bid_lvls']}\n"
-        f"💰 Объём: 🔻 {stats['ask_vol']:.2f} {asset} / ${stats['ask_usd']:.0f} | 🔺 {stats['bid_vol']:.2f} {asset} / ${stats['bid_usd']:.0f}\n"
-        f"🟢 {'Покупатели' if stats['side']=='Покупатели' else 'Продавцы'} доминируют на {int(stats['side_pct'])}%\n\n"
-        "📌 Торговая идея:\n"
-        "<pre>Параметр         | Значение\n"
-        "------------------|-------------------------------\n"
-        "✅ Сценарий       | Лонг от поддержки {support}-{sup_top} $\n"
-        "⛔️ Стоп-лосс      | Ниже поддержки → {stop_loss} $\n"
-        "🎯 Цель           | {target_min}-{target_max} $ (захват ликвидности)\n"
-        "🔎 Доп. фильтр    | Подтверждение объёмом / свечой 1–5м\n"
-        "</pre>\n"
-    ).format(
-        support=int(stats['support']),
-        sup_top=int(stats['support']+25),
-        stop_loss=int(stats['support']-50),
-        target_min=int(stats['resistance']),
-        target_max=int(stats['resistance']+50),
-    )
-    return msg
-
-async def btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != USER_ID:
-        await update.message.reply_text("Нет доступа.")
-        return
-    stats = get_orderbook_stats("BTCUSDT", PCT)
-    msg = make_message(stats, "BTCUSDT")
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-async def eth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != USER_ID:
-        await update.message.reply_text("Нет доступа.")
-        return
-    stats = get_orderbook_stats("ETHUSDT", PCT)
-    msg = make_message(stats, "ETHUSDT")
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-if __name__ == "__main__":
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("btc", btc))
-    app.add_handler(CommandHandler("eth", eth))
-    app.run_polling()
+# Пример вызова:
+stats = get_orderbook_stats("BTCUSDT", pct=0.005)  # 0.5% диапазон
+print(stats)
