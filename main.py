@@ -10,7 +10,6 @@ load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 USER_ID = int(os.getenv('TELEGRAM_USER_ID', '437873124'))  # твой ID по умолчанию
 
-PAIR = 'BTCUSDT'
 PCT = 0.005  # ±0.5% глубина
 
 async def get_orderbook_stats(pair: str, pct: float):
@@ -25,30 +24,23 @@ async def get_orderbook_stats(pair: str, pct: float):
     lower = mid_price * Decimal(1 - pct)
     upper = mid_price * Decimal(1 + pct)
 
-    bid_vol, ask_vol = Decimal(0), Decimal(0)
-    bid_levels, ask_levels = 0, 0
-    support, resistance = None, None
-    support_vol, resistance_vol = Decimal(0), Decimal(0)
+    # Поддержка: самая крупная лимитная заявка в диапазоне [lower, mid_price]
+    bid_candidates = [(price, qty) for price, qty in bids if lower <= price <= mid_price]
+    support, support_vol = (None, None)
+    bid_vol, bid_levels = Decimal(0), 0
+    if bid_candidates:
+        support, support_vol = max(bid_candidates, key=lambda x: x[1])
+        bid_vol = sum(qty for _, qty in bid_candidates)
+        bid_levels = len(bid_candidates)
 
-    for price, qty in bids:
-        if price >= lower:
-            bid_vol += qty
-            bid_levels += 1
-            if not support:
-                support = price
-                support_vol = qty
-        else:
-            break
-
-    for price, qty in asks:
-        if price <= upper:
-            ask_vol += qty
-            ask_levels += 1
-            if not resistance:
-                resistance = price
-                resistance_vol = qty
-        else:
-            break
+    # Сопротивление: самая крупная лимитная заявка в диапазоне [mid_price, upper]
+    ask_candidates = [(price, qty) for price, qty in asks if mid_price <= price <= upper]
+    resistance, resistance_vol = (None, None)
+    ask_vol, ask_levels = Decimal(0), 0
+    if ask_candidates:
+        resistance, resistance_vol = max(ask_candidates, key=lambda x: x[1])
+        ask_vol = sum(qty for _, qty in ask_candidates)
+        ask_levels = len(ask_candidates)
 
     dom_side = "Покупатели" if bid_vol > ask_vol else "Продавцы"
     dom_pct = int(abs(bid_vol - ask_vol) / max(bid_vol, ask_vol) * 100) if max(bid_vol, ask_vol) > 0 else 0
@@ -70,6 +62,8 @@ async def get_orderbook_stats(pair: str, pct: float):
     }
 
 def format_number(n, prec=2):
+    if n is None:
+        return "-"
     return f"{n:,.{prec}f}".replace(",", " ")
 
 async def send_orderbook(update: Update, context: ContextTypes.DEFAULT_TYPE, pair: str):
@@ -91,8 +85,8 @@ async def send_orderbook(update: Update, context: ContextTypes.DEFAULT_TYPE, pai
 <pre>Параметр       | Значение
 ----------------|-------------------------------
 ✅ Сценарий     | Лонг от поддержки {format_number(stats['support'], 2)} $
-⛔ Стоп-лосс    | Ниже поддержки → {format_number(stats['support'] * Decimal("0.995"), 2)} $
-🎯 Цель         | {format_number(stats['support'] * Decimal('1.005'), 2)}–{format_number(stats['support'] * Decimal('1.01'), 2)} $ (захват ликвидности)
+⛔ Стоп-лосс    | Ниже поддержки → {format_number((stats['support'] or 0) * Decimal("0.995"), 2)} $
+🎯 Цель         | {(format_number((stats['support'] or 0) * Decimal('1.005'), 2))}–{format_number((stats['support'] or 0) * Decimal('1.01'), 2)} $ (захват ликвидности)
 🔎 Доп. фильтр  | Подтверждение объёмом / свечой 1–5м
 </pre>
 """
