@@ -1,5 +1,4 @@
 import feedparser
-import datetime
 
 # Ключевые слова для фильтрации новостей
 KEYWORDS = ['btc', 'bitcoin', 'eth', 'ethereum', 'etf', 'crypto', 'trump', 'blackrock', 'sec', 'halving', 'spot', 'approval']
@@ -7,7 +6,7 @@ KEYWORDS = ['btc', 'bitcoin', 'eth', 'ethereum', 'etf', 'crypto', 'trump', 'blac
 # Храним уже отправленные заголовки, чтобы не было повторов
 already_sent_titles = set()
 
-def fetch_coindesk_news():
+def fetch_coindesk_news(force_all=False):
     print("📡 Чтение новостей из CoinDesk...")
     feed_url = "https://www.coindesk.com/arc/outboundfeeds/rss/"
     feed = feedparser.parse(feed_url)
@@ -20,7 +19,7 @@ def fetch_coindesk_news():
         print(f"→ Проверка: {title}")
 
         if any(keyword.lower() in title.lower() for keyword in KEYWORDS):
-            if title not in already_sent_titles:
+            if force_all or title not in already_sent_titles:
                 print(f"✅ Добавлено: {title}")
                 filtered.append({
                     "title": title,
@@ -35,12 +34,12 @@ def fetch_coindesk_news():
     return filtered
 
 def fetch_crypto_panic_news():
-    # Здесь можно подключить CryptoPanic API при необходимости
+    # Здесь можно подключить API позже
     return []
 
-def fetch_all_news():
+def fetch_all_news(force_all=False):
     print("⏰ Проверка новостей по всем источникам...")
-    news = fetch_coindesk_news() + fetch_crypto_panic_news()
+    news = fetch_coindesk_news(force_all=force_all) + fetch_crypto_panic_news()
     print(f"🗞 Всего подходящих новостей: {len(news)}")
     return news
 
