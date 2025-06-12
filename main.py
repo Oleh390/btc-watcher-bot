@@ -1,140 +1,133 @@
-import asyncio
 import os
-from decimal import Decimal
-from dotenv import load_dotenv
+import asyncio
 from binance import AsyncClient
-from telegram import Bot
-from telegram.constants import ParseMode
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from dotenv import load_dotenv
+from decimal import Decimal, ROUND_DOWN
 
 load_dotenv()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_USER_ID")
-PAIR = "BTCUSDT"
 
-INTERVALS = [
-    (0.2, "±0.2%"),
-    (0.4, "±0.4%"),
-    (2, "±2%"),
-    (4, "±4%"),
-]
+PAIR = "BTCUSDT"
+PERCENTS = [0.2, 0.4, 2, 4]  # В процентах
+LIMIT = 1000
+
+def fmt(num, digits=2):
+    if isinstance(num, float):
+        num = Decimal(str(num))
+    if num >= 1000:
+        return f"{num.quantize(Decimal('1'), rounding=ROUND_DOWN):,}".replace(',', ' ')
+    fmtstr = f"{{0:.{digits}f}}"
+    return fmtstr.format(float(num))
+
+def get_side_dominance(bid_volume, ask_volume):
+    if bid_volume > ask_volume:
+        return "buy", bid_volume, ask_volume, int((bid_volume - ask_volume) / (bid_volume + ask_volume) * 100)
+    else:
+        return "sell", bid_volume, ask_volume, int((ask_volume - bid_volume) / (bid_volume + ask_volume) * 100)
 
 async def get_order_book():
-    async with AsyncClient() as client:
-        depth = await client.get_order_book(symbol=PAIR, limit=1000)
-        bids = [(float(price), float(amount)) for price, amount in depth["bids"]]
-        asks = [(float(price), float(amount)) for price, amount in depth["asks"]]
-        return bids, asks
+    client = await AsyncClient.create()
+    depth = await client.get_order_book(symbol=PAIR, limit=LIMIT)
+    await client.close_connection()
+    bids = [(float(price), float(amount)) for price, amount in depth["bids"]]
+    asks = [(float(price), float(amount)) for price, amount in depth["asks"]]
+    return bids, asks
 
-def calc_levels(bids, asks, mid_price, percent):
-    lower = mid_price * (1 - percent / 100)
-    upper = mid_price * (1 + percent / 100)
-    asks_in_range = [(p, q) for p, q in asks if lower < p <= upper]
-    bids_in_range = [(p, q) for p, q in bids if lower <= p < upper]
-    ask_count = len(asks_in_range)
-    bid_count = len(bids_in_range)
-    ask_volume = sum(q for p, q in asks_in_range)
-    bid_volume = sum(q for p, q in bids_in_range)
-    ask_money = sum(p * q for p, q in asks_in_range)
-    bid_money = sum(p * q for p, q in bids_in_range)
-    support = max(bids_in_range, key=lambda x: x[1], default=(0, 0))  # bid с макс. объемом
-    resistance = max(asks_in_range, key=lambda x: x[1], default=(0, 0))  # ask с макс. объемом
-    rng_min = min([p for p, _ in bids_in_range + asks_in_range], default=mid_price)
-    rng_max = max([p for p, _ in bids_in_range + asks_in_range], default=mid_price)
-    side = "Покупатели" if bid_volume > ask_volume else "Продавцы"
-    dom_pct = int(abs(bid_volume - ask_volume) / max(bid_volume + ask_volume, 1e-8) * 100)
+def calc_levels(bids, asks, percent, last_price):
+    p = percent / 100
+    min_price = last_price * (1 - p)
+    max_price = last_price * (1 + p)
+
+    bids_filtered = [b for b in bids if min_price <= b[0] <= last_price]
+    asks_filtered = [a for a in asks if last_price <= a[0] <= max_price]
+    bid_levels = len(bids_filtered)
+    ask_levels = len(asks_filtered)
+    bid_volume = sum(b[1] for b in bids_filtered)
+    ask_volume = sum(a[1] for a in asks_filtered)
+    best_bid = max(bids_filtered, default=(0, 0))[0] if bids_filtered else 0
+    best_ask = min(asks_filtered, default=(0, 0))[0] if asks_filtered else 0
+    support = min(bids_filtered, default=(0, 0))[0] if bids_filtered else 0
+    resistance = max(asks_filtered, default=(0, 0))[0] if asks_filtered else 0
     return {
-        "support": support,
-        "resistance": resistance,
-        "bid_count": bid_count,
-        "ask_count": ask_count,
+        "percent": percent,
+        "min_price": min_price,
+        "max_price": max_price,
+        "bid_levels": bid_levels,
+        "ask_levels": ask_levels,
         "bid_volume": bid_volume,
         "ask_volume": ask_volume,
-        "bid_money": bid_money,
-        "ask_money": ask_money,
-        "rng_min": rng_min,
-        "rng_max": rng_max,
-        "side": side,
-        "dom_pct": dom_pct,
-        "label": f"±{percent}%",
-        "percent": percent
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "support": support,
+        "resistance": resistance,
     }
 
-def format_num(n, nd=2):
-    if n is None: return "—"
-    if abs(n) >= 10000:
-        return f"{n:,.0f}".replace(",", " ")
-    return f"{n:,.{nd}f}"
+def get_emoji(side):
+    return "🟢" if side == "buy" else "🔴"
 
-def choose_best_range(levels):
-    # Сначала ищем max объём поддержки (для покупателей), потом max объём сопротивления (для продавцов)
-    max_bid = max(levels, key=lambda l: l['bid_volume'])
-    max_ask = max(levels, key=lambda l: l['ask_volume'])
-    if max_bid["side"] == "Покупатели" and max_bid["bid_volume"] > 0:
-        return max_bid, "long"
-    elif max_ask["side"] == "Продавцы" and max_ask["ask_volume"] > 0:
-        return max_ask, "short"
-    else:
-        return levels[0], "long"  # fallback
-
-def build_message(levels, mid_price, idea_level, idea_type):
-    lines = ["📊 BTC/USDT Order Book\n"]
-    for lvl in levels:
-        lines.append(
-            f"🔵 {lvl['label']}\n"
-            f"📉 Сопротивление: {format_num(lvl['resistance'][0])} $ ({format_num(lvl['resistance'][1], 0)} BTC)"
-            f"\n📊 Поддержка: {format_num(lvl['support'][0])} $ ({format_num(lvl['support'][1], 0)} BTC)"
-            f"\n📈 Диапазон: {format_num(lvl['rng_min'])} — {format_num(lvl['rng_max'])}"
-            f"\n🟥 ask уровней: {lvl['ask_count']} | 🟩 bid уровней: {lvl['bid_count']}"
-            f"\n💰 Объём: 🔻 {format_num(lvl['ask_volume'], 2)} BTC / ${format_num(lvl['ask_money'], 0)}"
-            f" | 🔺 {format_num(lvl['bid_volume'], 2)} BTC / ${format_num(lvl['bid_money'], 0)}"
-            f"\n{'🟢'*2 if lvl['side'] == 'Покупатели' else '🔴'*2} {lvl['side']} доминируют на {lvl['dom_pct']}%"
-            "\n"
-        )
-
-    # Описание торговой идеи:
-    reason = ""
-    if idea_type == "long":
-        reason = (
-            f"Бот выбрал диапазон <b>{idea_level['label']}</b>, т.к. здесь максимальный объём на поддержку "
-            f"(<b>{format_num(idea_level['bid_volume'], 0)} BTC</b>) и явное доминирование покупателей (<b>{idea_level['dom_pct']}%</b>)."
-        )
-        entry = f"Лонг от поддержки {format_num(idea_level['support'][0]-25)}–{format_num(idea_level['support'][0])} $"
-        sl = f"Ниже поддержки → {format_num(idea_level['support'][0]-50)} $"
-        tp = f"{format_num(idea_level['support'][0])}–{format_num(idea_level['support'][0]+550)} $ (захват ликвидности)"
-    else:
-        reason = (
-            f"Бот выбрал диапазон <b>{idea_level['label']}</b>, т.к. здесь максимальный объём на сопротивление "
-            f"(<b>{format_num(idea_level['ask_volume'], 0)} BTC</b>) и явное доминирование продавцов (<b>{idea_level['dom_pct']}%</b>)."
-        )
-        entry = f"Шорт от сопротивления {format_num(idea_level['resistance'][0])}–{format_num(idea_level['resistance'][0]+25)} $"
-        sl = f"Выше сопротивления → {format_num(idea_level['resistance'][0]+50)} $"
-        tp = f"{format_num(idea_level['resistance'][0]-550)}–{format_num(idea_level['resistance'][0])} $ (захват ликвидности)"
-
-    lines.append(
-        f"\n📌 💡 <b>Торговая идея (авто-выбор диапазона)</b>\n"
-        f"{reason}\n"
-        "<pre>Параметр         | Значение\n"
-        "------------------|-------------------------------\n"
-        f"✅ Сценарий       | {entry}\n"
-        f"⛔️ Стоп-лосс      | {sl}\n"
-        f"🎯 Цель           | {tp}\n"
-        f"🔎 Доп. фильтр    | Подтверждение объёмом / свечой 1–5м\n"
-        "</pre>"
-    )
-    return "\n".join(lines)
-
-async def main():
-    bot = Bot(token=TELEGRAM_TOKEN)
+async def handle_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bids, asks = await get_order_book()
-    mid_price = (asks[0][0] + bids[0][0]) / 2 if asks and bids else 0
+    last_price = asks[0][0] if asks and bids and asks[0][0] > bids[0][0] else (bids[0][0] if bids else 0)
+    book_lines = ["📊 BTC/USDT Order Book\n"]
 
-    levels = []
-    for pct, label in INTERVALS:
-        levels.append(calc_levels(bids, asks, mid_price, pct))
+    stats_by_level = {}
+    for percent in PERCENTS:
+        stats = calc_levels(bids, asks, percent, last_price)
+        stats_by_level[percent] = stats
 
-    idea_level, idea_type = choose_best_range(levels)
-    message = build_message(levels, mid_price, idea_level, idea_type)
-    await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode=ParseMode.HTML)
+        dominance_side, bid_vol, ask_vol, dom_percent = get_side_dominance(stats["bid_volume"], stats["ask_volume"])
+        emoji = get_emoji(dominance_side)
+        book_lines.append(
+            f"🔵 ±{percent}%\n"
+            f"📉 Сопротивление: {fmt(stats['resistance'])} $ ({fmt(stats['ask_volume'], 0)} BTC)\n"
+            f"📊 Поддержка: {fmt(stats['support'])} $ ({fmt(stats['bid_volume'], 0)} BTC)\n"
+            f"📈 Диапазон: {fmt(stats['min_price'])} — {fmt(stats['max_price'])}\n"
+            f"🟥 ask уровней: {stats['ask_levels']} | 🟩 bid уровней: {stats['bid_levels']}\n"
+            f"💰 Объём: 🔻 {fmt(stats['ask_volume'])} BTC | 🔺 {fmt(stats['bid_volume'])} BTC\n"
+            f"{emoji*2} {'Покупатели' if dominance_side == 'buy' else 'Продавцы'} доминируют на {abs(dom_percent)}%\n"
+        )
+
+    # Выбор лучшего диапазона для "Торговой идеи"
+    best_percent = max(PERCENTS, key=lambda p: abs(stats_by_level[p]["bid_volume"] - stats_by_level[p]["ask_volume"]))
+    best = stats_by_level[best_percent]
+    dominance_side, _, _, dom_percent = get_side_dominance(best["bid_volume"], best["ask_volume"])
+    scenario = (
+        f"Лонг от поддержки {fmt(best['support'])}–{fmt(best['best_bid'])} $"
+        if dominance_side == "buy"
+        else f"Шорт от сопротивления {fmt(best['best_ask'])}–{fmt(best['resistance'])} $"
+    )
+    stop_loss = (
+        f"Ниже поддержки → {fmt(best['support'] * 0.995)} $"
+        if dominance_side == "buy"
+        else f"Выше сопротивления → {fmt(best['resistance'] * 1.005)} $"
+    )
+    take_profit = (
+        f"{fmt(best['best_bid'])}–{fmt(best['best_bid'] + (best['best_bid'] * 0.5/100))} $ (захват ликвидности)"
+        if dominance_side == "buy"
+        else f"{fmt(best['best_ask'])}–{fmt(best['best_ask'] - (best['best_ask'] * 0.5/100))} $ (захват ликвидности)"
+    )
+
+    book_lines.append(
+        "\n📌 💡 <b>Торговая идея (авто-выбор диапазона):</b>\n"
+        f'<pre>Параметр         | Значение\n'
+        f'------------------|-------------------------------\n'
+        f'✅ Сценарий       | {scenario}\n'
+        f'⛔ Стоп-лосс      | {stop_loss}\n'
+        f'🎯 Цель           | {take_profit}\n'
+        f'🔎 Доп. фильтр    | Подтверждение объёмом / свечой 1–5м\n'
+        f'</pre>\n'
+        f'Бот выбрал диапазон ±{best_percent}%, '
+        f'т.к. здесь максимальный {"объём на поддержку" if dominance_side == "buy" else "объём на сопротивление"} '
+        f'и явное доминирование {"покупателей" if dominance_side == "buy" else "продавцов"} ({abs(dom_percent)}%)'
+    )
+
+    await update.message.reply_text(
+        "\n".join(book_lines), parse_mode="HTML"
+    )
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("watch", handle_watch))
+    app.run_polling()
