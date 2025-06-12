@@ -1,57 +1,38 @@
-import requests
-import feedparser
-from datetime import datetime
+import os
+import asyncio
+from telegram import Bot, Update
+from telegram.ext import ApplicationBuilder, CommandHandler
+from news_handler import fetch_all_news, format_news_message
+from dotenv import load_dotenv
 
-KEYWORDS = [
-    'bitcoin', 'btc', 'ethereum', 'eth', 'etf', 'sec', 'blackrock', 'trump',
-    'cpi', 'inflation', 'fed', 'stablecoin', 'approval', 'china', 'fomc'
-]
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = int(os.getenv("TELEGRAM_USER_ID"))
 
-MAX_NEWS = 5
+bot = Bot(token=TOKEN)
 
-def fetch_coindesk_news():
-    url = "https://www.coindesk.com/arc/outboundfeeds/rss/"
-    feed = feedparser.parse(url)
-    filtered = []
-    for entry in feed.entries:
-        if any(keyword.lower() in entry.title.lower() for keyword in KEYWORDS):
-            filtered.append({
-                'title': entry.title,
-                'link': entry.link,
-                'published': entry.published
-            })
-    return filtered[:MAX_NEWS]
+async def send_news():
+    news_list = fetch_all_news()
+    for item in news_list:
+        msg = format_news_message(item)
+        await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="HTML")
 
-def fetch_crypto_panic_news():
-    url = "https://cryptopanic.com/api/v1/posts/?auth_token=&kind=news"
-    try:
-        response = requests.get(url)
-        data = response.json()
-        filtered = []
-        for item in data.get("results", []):
-            if any(keyword.lower() in item['title'].lower() for keyword in KEYWORDS):
-                filtered.append({
-                    'title': item['title'],
-                    'link': item['url'],
-                    'published': item['published_at']
-                })
-        return filtered[:MAX_NEWS]
-    except:
-        return []
+async def news_command(update: Update, context):
+    await send_news()
 
-def fetch_all_news():
-    news = fetch_coindesk_news() + fetch_crypto_panic_news()
-    unique_titles = set()
-    unique_news = []
-    for item in news:
-        if item['title'] not in unique_titles:
-            unique_titles.add(item['title'])
-            unique_news.append(item)
-    return unique_news[:MAX_NEWS]
+app = ApplicationBuilder().token(TOKEN).build()
+app.add_handler(CommandHandler("news", news_command))
 
-def format_news_message(item):
-    return (
-        f"🗞️ <b>{item['title']}</b>\n"
-        f"📅 {item['published']}\n"
-        f"🔗 <a href=\"{item['link']}\">Читать</a>"
+async def scheduler():
+    while True:
+        await send_news()
+        await asyncio.sleep(600)  # 10 минут
+
+async def main():
+    await asyncio.gather(
+        app.run_polling(),
+        scheduler()
     )
+
+if __name__ == '__main__':
+    asyncio.run(main())
