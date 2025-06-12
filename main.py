@@ -16,36 +16,41 @@ def get_orderbook_stats(symbol="BTCUSDT", pct=0.005):
     depth = client.get_order_book(symbol=symbol, limit=1000)
     bids = [(Decimal(price), Decimal(qty)) for price, qty in depth["bids"]]
     asks = [(Decimal(price), Decimal(qty)) for price, qty in depth["asks"]]
-    price = (bids[0][0] + asks[0][0]) / 2  # mid price
+    mid_price = float((bids[0][0] + asks[0][0]) / 2) if bids and asks else 0
 
-    upper = price * (1 + Decimal(pct))
-    lower = price * (1 - Decimal(pct))
+    upper = mid_price * (1 + Decimal(pct))
+    lower = mid_price * (1 - Decimal(pct))
 
     ask_within = [(p, q) for p, q in asks if p <= upper]
     bid_within = [(p, q) for p, q in bids if p >= lower]
+
+    bid_vol = sum(q for p, q in bid_within)
+    ask_vol = sum(q for p, q in ask_within)
 
     res = {
         "resistance": float(max(ask_within, default=(0, 0))[0]) if ask_within else None,
         "resistance_qty": float(sum(q for p, q in ask_within)),
         "support": float(min(bid_within, default=(0, 0))[0]) if bid_within else None,
         "support_qty": float(sum(q for p, q in bid_within)),
-        "range_low": float(min(bid_within, default=(price,))[0]),
-        "range_high": float(max(ask_within, default=(price,))[0]),
+        "range_low": float(min(bid_within, default=(mid_price,))[0]) if bid_within else mid_price,
+        "range_high": float(max(ask_within, default=(mid_price,))[0]) if ask_within else mid_price,
         "ask_lvls": len(ask_within),
         "bid_lvls": len(bid_within),
-        "ask_vol": float(sum(q for p, q in ask_within)),
-        "bid_vol": float(sum(q for p, q in bid_within)),
+        "ask_vol": float(ask_vol),
+        "bid_vol": float(bid_vol),
         "ask_usd": float(sum(p*q for p, q in ask_within)),
         "bid_usd": float(sum(p*q for p, q in bid_within)),
-        "side": "Покупатели" if sum(q for p, q in bid_within) > sum(q for p, q in ask_within) else "Продавцы",
-        "side_pct": abs(sum(q for p, q in bid_within) - sum(q for p, q in ask_within)) / max(sum(q for p, q in bid_within), 1) * 100,
+        "side": "Покупатели" if bid_vol > ask_vol else "Продавцы",
+        "side_pct": abs(bid_vol - ask_vol) / max(bid_vol, 1) * 100,
+        "mid_price": mid_price
     }
     return res
 
 def make_message(stats, symbol="BTCUSDT"):
     asset = symbol.replace("USDT", "")
     msg = (
-        f"📊 {asset}/USDT Order Book (±0.5%)\n\n"
+        f"📊 {asset}/USDT Order Book (±0.5%)\n"
+        f"Цена: {stats['mid_price']:.2f} $\n\n"
         f"📉 Сопротивление: {stats['resistance']:.2f} $ ({stats['resistance_qty']:.2f} {asset})\n"
         f"📊 Поддержка: {stats['support']:.2f} $ ({stats['support_qty']:.2f} {asset})\n"
         f"📈 Диапазон: {stats['range_low']:.2f} — {stats['range_high']:.2f}\n"
