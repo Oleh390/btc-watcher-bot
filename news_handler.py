@@ -1,56 +1,52 @@
-import requests
 import feedparser
+import datetime
 
-KEYWORDS = [
-    'bitcoin', 'btc', 'ethereum', 'eth', 'etf', 'sec', 'blackrock', 'trump',
-    'cpi', 'inflation', 'fed', 'stablecoin', 'approval', 'china', 'fomc'
-]
+# Ключевые слова для фильтрации новостей
+KEYWORDS = ['btc', 'bitcoin', 'eth', 'ethereum', 'etf', 'crypto', 'trump', 'blackrock', 'sec', 'halving', 'spot', 'approval']
 
-MAX_NEWS = 5
+# Храним уже отправленные заголовки, чтобы не было повторов
+already_sent_titles = set()
 
 def fetch_coindesk_news():
-    url = "https://www.coindesk.com/arc/outboundfeeds/rss/"
-    feed = feedparser.parse(url)
+    print("📡 Чтение новостей из CoinDesk...")
+    feed_url = "https://www.coindesk.com/arc/outboundfeeds/rss/"
+    feed = feedparser.parse(feed_url)
+
     filtered = []
     for entry in feed.entries:
-        if any(keyword.lower() in entry.title.lower() for keyword in KEYWORDS):
-            filtered.append({
-                'title': entry.title,
-                'link': entry.link,
-                'published': entry.published
-            })
-    return filtered[:MAX_NEWS]
+        published = entry.get("published", "")
+        title = entry.get("title", "")
+        link = entry.get("link", "")
+        print(f"→ Проверка: {title}")
+
+        if any(keyword.lower() in title.lower() for keyword in KEYWORDS):
+            if title not in already_sent_titles:
+                print(f"✅ Добавлено: {title}")
+                filtered.append({
+                    "title": title,
+                    "link": link,
+                    "published": published
+                })
+                already_sent_titles.add(title)
+            else:
+                print(f"⚠️ Пропущено (уже отправлено): {title}")
+        else:
+            print(f"❌ Пропущено (нет ключевых слов): {title}")
+    return filtered
 
 def fetch_crypto_panic_news():
-    url = "https://cryptopanic.com/api/v1/posts/?auth_token=&kind=news"
-    try:
-        response = requests.get(url)
-        data = response.json()
-        filtered = []
-        for item in data.get("results", []):
-            if any(keyword.lower() in item['title'].lower() for keyword in KEYWORDS):
-                filtered.append({
-                    'title': item['title'],
-                    'link': item['url'],
-                    'published': item['published_at']
-                })
-        return filtered[:MAX_NEWS]
-    except:
-        return []
+    # Здесь можно подключить CryptoPanic API при необходимости
+    return []
 
 def fetch_all_news():
+    print("⏰ Проверка новостей по всем источникам...")
     news = fetch_coindesk_news() + fetch_crypto_panic_news()
-    unique_titles = set()
-    unique_news = []
-    for item in news:
-        if item['title'] not in unique_titles:
-            unique_titles.add(item['title'])
-            unique_news.append(item)
-    return unique_news[:MAX_NEWS]
+    print(f"🗞 Всего подходящих новостей: {len(news)}")
+    return news
 
 def format_news_message(item):
     return (
-        f"🗞️ <b>{item['title']}</b>\n"
-        f"📅 {item['published']}\n"
-        f"🔗 <a href=\"{item['link']}\">Читать</a>"
+        f"📰 <b>{item['title']}</b>\n"
+        f"🗓 <i>{item['published']}</i>\n"
+        f"🔗 <a href='{item['link']}'>Читать</a>"
     )
