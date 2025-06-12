@@ -1,121 +1,110 @@
-TELEGRAM_TOKEN = "7830848319:AAHjRmoCT_1u8ufoIqWDYqi8aT1oFya_Lvs"
-TELEGRAM_USER_ID = "437873124"
-
 import asyncio
-import logging
-from decimal import Decimal
 from binance import AsyncClient
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+import os
 
-# Убираем лишние логи от binance
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = int(os.getenv("TELEGRAM_USER_ID", "0"))
 
-DEPTH_LEVELS = [0.002, 0.004, 0.02, 0.04]  # ±0.2%, ±0.4%, ±2%, ±4%
-PAIR = "BTCUSDT"
+depth_ranges = [
+    0.002,  # ±0.2%
+    0.004,  # ±0.4%
+    0.02,   # ±2%
+    0.04,   # ±4%
+    0.10    # ±10%
+]
 
-def round_btc(val):
-    return float(Decimal(val).quantize(Decimal('1.00')))
-
-def round_usd(val):
-    return float(Decimal(val).quantize(Decimal('1')))
+depth_labels = [
+    "±0.2%",
+    "±0.4%",
+    "±2%",
+    "±4%",
+    "±10%",
+]
 
 async def get_order_book():
-    async with AsyncClient() as client:
-        data = await client.get_order_book(symbol=PAIR, limit=1000)
-        return data["bids"], data["asks"]
+    client = await AsyncClient.create()
+    try:
+        order_book = await client.get_order_book(symbol="BTCUSDT", limit=1000)
+        bids = [(float(price), float(amount)) for price, amount in order_book['bids']]
+        asks = [(float(price), float(amount)) for price, amount in order_book['asks']]
+        return bids, asks
+    finally:
+        await client.close_connection()
 
-def analyze_depth(bids, asks, price, pct):
-    upper = price * (1 + pct)
-    lower = price * (1 - pct)
-    bids_in = [b for b in bids if lower <= float(b[0]) <= price]
-    asks_in = [a for a in asks if price <= float(a[0]) <= upper]
+def calc_stats(bids, asks, range_pct):
+    if not bids or not asks:
+        return {}
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    mid_price = (best_bid + best_ask) / 2
 
-    bid_vol = sum(float(b[1]) for b in bids_in)
-    ask_vol = sum(float(a[1]) for a in asks_in)
-    bid_lvl = len(bids_in)
-    ask_lvl = len(asks_in)
+    low = mid_price * (1 - range_pct)
+    high = mid_price * (1 + range_pct)
 
-    support = min(float(b[0]) for b in bids_in) if bids_in else 0
-    resistance = max(float(a[0]) for a in asks_in) if asks_in else 0
+    bid_vol = sum(amount for price, amount in bids if price >= low and price <= mid_price)
+    ask_vol = sum(amount for price, amount in asks if price <= high and price >= mid_price)
+
+    bid_usd = sum(amount * price for price, amount in bids if price >= low and price <= mid_price)
+    ask_usd = sum(amount * price for price, amount in asks if price <= high and price >= mid_price)
+
+    resistance = max((price, amount) for price, amount in asks if price <= high and price >= mid_price)
+    support = min((price, amount) for price, amount in bids if price >= low and price <= mid_price)
 
     return {
+        "label": f"±±{int(range_pct*100)}%" if range_pct < 0.01 else f"±{int(range_pct*100)}%",
         "support": support,
         "resistance": resistance,
         "bid_vol": bid_vol,
         "ask_vol": ask_vol,
-        "bid_lvl": bid_lvl,
-        "ask_lvl": ask_lvl,
-        "lower": lower,
-        "upper": upper,
+        "bid_usd": bid_usd,
+        "ask_usd": ask_usd,
+        "low": low,
+        "high": high
     }
 
-def build_message(depth_stats):
-    msg = "<b>📊 BTC/USDT Order Book</b>\n\n"
-    best_idea = None
-    best_volume = 0
+def format_stats(stats):
+    text = ""
+    for s in stats:
+        sup_price, sup_amt = s["support"]
+        res_price, res_amt = s["resistance"]
+        text += f"\n🔵 {s['label']}\n"
+        text += f"📉 Сопротивление: {res_price:,.2f} $ ({int(res_amt)} BTC)\n"
+        text += f"📊 Поддержка: {sup_price:,.2f} $ ({int(sup_amt)} BTC)\n"
+        text += f"📈 Диапазон: {s['low']:,.2f} — {s['high']:,.2f}\n"
+        text += f"🟥 ask уровней: 1000 | 🟩 bid уровней: 1000\n"
+        text += f"💰 Объём: 🔻 {s['ask_vol']:.2f} BTC / ${int(s['ask_usd']):,} | 🔺 {s['bid_vol']:.2f} BTC / ${int(s['bid_usd']):,}\n"
+        dom = "Покупатели доминируют" if s['bid_vol'] > s['ask_vol'] else "Продавцы доминируют"
+        percent = int(abs(s['bid_vol'] - s['ask_vol']) / max(s['bid_vol'], s['ask_vol']) * 100) if max(s['bid_vol'], s['ask_vol']) > 0 else 0
+        text += f"🟢 {dom} на {percent}%\n"
+    return text
 
-    for i, (label, stat) in enumerate(depth_stats.items()):
-        buyers_domi = int(100 * stat['bid_vol'] / max(stat['ask_vol'] + stat['bid_vol'], 1))
-        sellers_domi = 100 - buyers_domi
-
-        # выбираем диапазон для авто-идеи
-        if stat['bid_vol'] > best_volume and buyers_domi > 10:
-            best_idea = (label, stat)
-            best_volume = stat['bid_vol']
-
-        domi_emoji = "🟢 Покупатели" if buyers_domi > sellers_domi else "🔴 Продавцы"
-        domi_val = buyers_domi if buyers_domi > sellers_domi else sellers_domi
-
-        msg += (
-            f"🔵 ±{label}\n"
-            f"📉 Сопротивление: {round_usd(stat['resistance'])} $ ({round_btc(stat['ask_vol'])} BTC)\n"
-            f"📊 Поддержка: {round_usd(stat['support'])} $ ({round_btc(stat['bid_vol'])} BTC)\n"
-            f"📈 Диапазон: {round_usd(stat['lower'])} — {round_usd(stat['upper'])}\n"
-            f"🟥 ask уровней: {stat['ask_lvl']} | 🟩 bid уровней: {stat['bid_lvl']}\n"
-            f"💰 Объём: 🔻 {round_btc(stat['ask_vol'])} BTC | 🔺 {round_btc(stat['bid_vol'])} BTC\n"
-            f"{domi_emoji} доминируют на {domi_val}%\n\n"
-        )
-    # Торговая идея на лучшем диапазоне
-    if best_idea:
-        label, stat = best_idea
-        support = round_usd(stat['support'])
-        sl = support - 500
-        tp1 = support + 600
-        tp2 = support + 1200
-
-        msg += (
-            "📌 <b>Торговая идея (авто-выбор диапазона):</b>\n"
-            "<pre>Параметр    | Значение\n"
-            "----------------|----------------------------------------\n"
-            f"✅ Сценарий     | Лонг от поддержки {support-25}-{support} $\n"
-            f"⛔️ Стоп-лосс    | Ниже поддержки → {sl} $\n"
-            f"🎯 Цель         | {tp1}-{tp2} $ (захват ликвидности)\n"
-            f"🔎 Доп. фильтр  | Подтверждение объёмом / свечой 1–5м\n"
-            "</pre>"
-        )
-
-    return msg
+def trading_idea(stats):
+    support = stats[0]["support"][0]
+    resistance = stats[0]["resistance"][0]
+    stop_loss = support - 0.5 * (resistance - support)
+    target = resistance + (resistance - support)
+    return (
+        "<b>📌 💡 Торговая идея:</b>\n"
+        "<pre>Параметр         | Значение\n"
+        "------------------|-------------------------------\n"
+        f"✅ Сценарий       | Лонг от поддержки {support:,.0f}–{resistance:,.0f} $\n"
+        f"⛔️ Стоп-лосс      | Ниже поддержки → {stop_loss:,.0f} $\n"
+        f"🎯 Цель           | {resistance:,.0f}–{target:,.0f} $ (захват ликвидности)\n"
+        f"🔎 Доп. фильтр    | Подтверждение объёмом / свечой 1–5м\n"
+        "</pre>"
+    )
 
 async def handle_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Загрузка данных по стакану...", parse_mode="HTML")
     bids, asks = await get_order_book()
-    price = float(asks[0][0])  # best ask (или можешь заменить на среднее между лучшей ценой bid/ask)
-    depth_stats = {}
-
-    for pct in DEPTH_LEVELS:
-        label = f"{pct*100:.1f}%"
-        stat = analyze_depth(bids, asks, price, pct)
-        depth_stats[label] = stat
-
-    msg = build_message(depth_stats)
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("watch", handle_watch))
-    app.run_polling()
+    stats = [calc_stats(bids, asks, rng) for rng in depth_ranges]
+    text = "📊 BTC/USDT Order Book\n"
+    text += format_stats(stats)
+    text += "\n" + trading_idea(stats)
+    await update.message.reply_text(text, parse_mode="HTML")
 
 if __name__ == "__main__":
-    main()
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("watch", handle_watch))
+    app.run_polling()
