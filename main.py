@@ -1,130 +1,124 @@
 import os
 from decimal import Decimal
-from binance import AsyncClient
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from binance.client import Client
+from telegram import Bot
+from telegram.constants import ParseMode
 import asyncio
+from dotenv import load_dotenv
+
+load_dotenv()
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = int(os.getenv("TELEGRAM_USER_ID"))
+CHAT_ID = os.getenv("TELEGRAM_USER_ID")
 
-SYMBOL = "BTCUSDT"
-PRECISIONS = [0.002, 0.004, 0.02, 0.04, 0.1]  # ±0.2%, ±0.4%, ±2%, ±4%, ±10%
-PRECISIONS_LABELS = ["±0.2%", "±0.4%", "±2%", "±4%", "±10%"]
+PAIR = "BTCUSDT"
+DEPTH_LIMIT = 1000
 
-async def get_order_book():
-    client = await AsyncClient.create()
-    depth = await client.get_order_book(symbol=SYMBOL, limit=1000)
-    await client.close_connection()
-    bids = [(Decimal(price), Decimal(amount)) for price, amount in depth["bids"]]
-    asks = [(Decimal(price), Decimal(amount)) for price, amount in depth["asks"]]
+# Проценты диапазонов для анализа
+RANGES = [0.002, 0.004, 0.02, 0.04, 0.1]
+RANGE_LABELS = ["±0.2%", "±0.4%", "±2%", "±4%", "±10%"]
+
+client = Client()
+
+def get_order_book(symbol=PAIR, limit=DEPTH_LIMIT):
+    order_book = client.get_order_book(symbol=symbol, limit=limit)
+    bids = [(Decimal(price), Decimal(amount)) for price, amount, *_ in order_book["bids"]]
+    asks = [(Decimal(price), Decimal(amount)) for price, amount, *_ in order_book["asks"]]
     return bids, asks
 
-def filter_by_range(orders, price, pct, side):
-    low = price * (Decimal(1) - Decimal(pct))
-    high = price * (Decimal(1) + Decimal(pct))
-    if side == "bid":
-        filtered = [o for o in orders if low <= o[0] <= price]
+def aggregate_levels(levels, lower, upper, reverse=False):
+    filtered = [l for l in levels if lower <= l[0] <= upper]
+    if not filtered:
+        return 0, Decimal(0), 0
+    if reverse:
+        level = max(filtered, key=lambda x: x[0])
     else:
-        filtered = [o for o in orders if price <= o[0] <= high]
-    return filtered
+        level = min(filtered, key=lambda x: x[0])
+    volume = sum(a for _, a in filtered)
+    count = len(filtered)
+    return float(level[0]), float(volume), count
 
-def calc_stats(bids, asks, price, pct):
-    filtered_bids = filter_by_range(bids, price, pct, "bid")
-    filtered_asks = filter_by_range(asks, price, pct, "ask")
-    # Сортировка для поиска поддержки и сопротивления
-    filtered_bids.sort(reverse=True)   # bid — от большего к меньшему
-    filtered_asks.sort()               # ask — от меньшего к большему
-    support_price, support_amt = filtered_bids[0] if filtered_bids else (Decimal(0), Decimal(0))
-    resistance_price, resistance_amt = filtered_asks[0] if filtered_asks else (Decimal(0), Decimal(0))
-    total_bid = sum(amt for _, amt in filtered_bids)
-    total_ask = sum(amt for _, amt in filtered_asks)
-    total_bid_usd = sum(price * amt for price, amt in filtered_bids)
-    total_ask_usd = sum(price * amt for price, amt in filtered_asks)
-    bid_lvls = len(filtered_bids)
-    ask_lvls = len(filtered_asks)
-    dominance = int(round(100 * total_bid / (total_bid + total_ask), 0)) if (total_bid + total_ask) else 0
-    dom_side = "Покупатели" if dominance >= 50 else "Продавцы"
-    diff = dominance if dominance >= 50 else 100 - dominance
-    dom_emoji = "🟢" if dominance >= 50 else "🔴"
-    price_low = min(filtered_bids[0][0] if filtered_bids else price, filtered_asks[0][0] if filtered_asks else price)
-    price_high = max(filtered_bids[0][0] if filtered_bids else price, filtered_asks[0][0] if filtered_asks else price)
+def analyze_order_book(bids, asks, price, rng):
+    lower = price * (1 - rng)
+    upper = price * (1 + rng)
+    # Покупки и продажи отдельно в пределах диапазона
+    bids_in = [b for b in bids if lower <= b[0] < price]
+    asks_in = [a for a in asks if price < a[0] <= upper]
+    bid_vol = sum(a for _, a in bids_in)
+    ask_vol = sum(a for _, a in asks_in)
+    bid_val = sum(p * a for p, a in bids_in)
+    ask_val = sum(p * a for p, a in asks_in)
+    bid_count = len(bids_in)
+    ask_count = len(asks_in)
+    support = max(bids_in, key=lambda x: x[0], default=(0, 0))
+    resistance = min(asks_in, key=lambda x: x[0], default=(0, 0))
+    dom_side = "Покупатели" if bid_vol > ask_vol else "Продавцы"
+    dom_percent = abs(int(100 * (bid_vol - ask_vol) / (bid_vol + ask_vol))) if (bid_vol + ask_vol) else 0
     return {
-        "label": None,
-        "support": support_price,
-        "support_amt": support_amt,
-        "resist": resistance_price,
-        "resist_amt": resistance_amt,
-        "bid_lvls": bid_lvls,
-        "ask_lvls": ask_lvls,
-        "total_bid": total_bid,
-        "total_ask": total_ask,
-        "total_bid_usd": total_bid_usd,
-        "total_ask_usd": total_ask_usd,
-        "dominance": dominance,
+        "support": support,
+        "resistance": resistance,
+        "bid_vol": bid_vol,
+        "ask_vol": ask_vol,
+        "bid_val": bid_val,
+        "ask_val": ask_val,
+        "bid_count": bid_count,
+        "ask_count": ask_count,
+        "lower": lower,
+        "upper": upper,
         "dom_side": dom_side,
-        "diff": diff,
-        "dom_emoji": dom_emoji,
-        "price_low": price_low,
-        "price_high": price_high
+        "dom_percent": dom_percent
     }
 
-def format_number(x):
-    if isinstance(x, Decimal):
-        x = float(x)
-    if x >= 10000:
-        return f"{x:,.0f}".replace(",", " ")
-    if x >= 1000:
-        return f"{x:,.2f}".replace(",", " ")
-    return str(round(x, 2))
+def format_value(val, d=2):
+    if val == 0:
+        return "—"
+    return f"{val:,.{d}f}".replace(",", " ")
 
-def format_stats(stats, label):
-    return (
-        f"\n🔵 {label}\n"
-        f"📉 Сопротивление: {format_number(stats['resist'])} $ ({format_number(stats['resist_amt'])} BTC)\n"
-        f"📊 Поддержка: {format_number(stats['support'])} $ ({format_number(stats['support_amt'])} BTC)\n"
-        f"📈 Диапазон: {format_number(stats['price_low'])} — {format_number(stats['price_high'])}\n"
-        f"🟥 ask уровней: {stats['ask_lvls']} | 🟩 bid уровней: {stats['bid_lvls']}\n"
-        f"💰 Объём: 🔻 {format_number(stats['total_bid'])} BTC / ${format_number(stats['total_bid_usd'])} | "
-        f"🔺 {format_number(stats['total_ask'])} BTC / ${format_number(stats['total_ask_usd'])}\n"
-        f"{stats['dom_emoji']} {stats['dom_side']} доминируют на {stats['diff']}%\n"
-    )
+async def send_signal():
+    bids, asks = get_order_book()
+    price = float(asks[0][0] + bids[0][0]) / 2
+    lines = [f"📊 BTC/USDT Order Book\n"]
 
-def generate_idea(support_price):
-    support_from = format_number(support_price)
-    support_to = format_number(support_price + Decimal('25'))
-    sl = format_number(support_price - Decimal('50'))
-    tp_from = format_number(support_price + Decimal('50'))
-    tp_to = format_number(support_price + Decimal('100'))
-    idea = (
-        "\n📌 💡 <b>Торговая идея:</b>\n"
-        "<pre>Параметр         | Значение\n"
-        "------------------|-------------------------------\n"
-        f"✅ Сценарий       | Лонг от поддержки {support_from}–{support_to} $\n"
-        f"⛔️ Стоп-лосс      | Ниже поддержки → {sl} $\n"
-        f"🎯 Цель           | {tp_from}–{tp_to} $ (захват ликвидности)\n"
-        f"🔎 Доп. фильтр    | Подтверждение объёмом / свечой 1–5м\n"
-        "</pre>"
-    )
-    return idea
-
-async def handle_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bids, asks = await get_order_book()
-    price = (bids[0][0] + asks[0][0]) / 2
-    message = "📊 BTC/USDT Order Book\n"
     all_stats = []
-    for pct, label in zip(PRECISIONS, PRECISIONS_LABELS):
-        stats = calc_stats(bids, asks, price, pct)
-        stats['label'] = label
+
+    for rng, label in zip(RANGES, RANGE_LABELS):
+        stats = analyze_order_book(bids, asks, price, rng)
+        # Формат
+        lines.append(
+            f"\n🔵 {label}\n"
+            f"📉 Сопротивление: {format_value(stats['resistance'][0])} $ ({format_value(stats['resistance'][1])} BTC)"
+            f"\n📊 Поддержка: {format_value(stats['support'][0])} $ ({format_value(stats['support'][1])} BTC)"
+            f"\n📈 Диапазон: {format_value(stats['lower'])} — {format_value(stats['upper'])}"
+            f"\n🟥 ask уровней: {stats['ask_count']} | 🟩 bid уровней: {stats['bid_count']}"
+            f"\n💰 Объём: 🔻 {format_value(stats['ask_vol'])} BTC / ${format_value(stats['ask_val'], 0)} | "
+            f"🔺 {format_value(stats['bid_vol'])} BTC / ${format_value(stats['bid_val'], 0)}"
+            f"\n{'🟢' if stats['dom_side']=='Покупатели' else '🔴'} {stats['dom_side']} доминируют на {stats['dom_percent']}%"
+        )
         all_stats.append(stats)
-        message += format_stats(stats, label)
-    # Добавляем "Торговая идея" по самой узкой поддержке
-    message += generate_idea(all_stats[0]['support'])
-    await update.message.reply_text(message, parse_mode="HTML")
+
+    # Формируем торговую идею (пример для лонга)
+    idea = all_stats[0]  # ±0.2%
+    if idea['dom_side'] == 'Покупатели' and idea['support'][0] > 0:
+        scenario = f"Лонг от поддержки {format_value(idea['support'][0]-25, 0)}–{format_value(idea['support'][0], 0)} $"
+        stop_loss = f"Ниже поддержки → {format_value(idea['support'][0]-50, 0)} $"
+        target = f"{format_value(idea['support'][0]+50, 0)}–{format_value(idea['support'][0]+100, 0)} $ (захват ликвидности)"
+        filter_text = "Подтверждение объёмом / свечой 1–5м"
+        lines.append("\n📌 💡 <b>Торговая идея:</b>")
+        lines.append(
+            "<pre>Параметр         | Значение\n"
+            "------------------|-------------------------------\n"
+            f"✅ Сценарий       | {scenario}\n"
+            f"⛔️ Стоп-лосс      | {stop_loss}\n"
+            f"🎯 Цель           | {target}\n"
+            f"🔎 Доп. фильтр    | {filter_text}\n"
+            "</pre>"
+        )
+
+    await Bot(token=TOKEN).send_message(
+        chat_id=CHAT_ID,
+        text="\n".join(lines),
+        parse_mode=ParseMode.HTML
+    )
 
 if __name__ == "__main__":
-    import dotenv
-    dotenv.load_dotenv()
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("watch", handle_watch))
-    app.run_polling()
+    asyncio.run(send_signal())
