@@ -40,22 +40,20 @@ def get_orderbook_stats(symbol="BTCUSDT", pct=0.005):
         "bid_usd": float(sum(p*q for p, q in bid_within)),
         "side": "Покупатели" if sum(q for p, q in bid_within) > sum(q for p, q in ask_within) else "Продавцы",
         "side_pct": abs(sum(q for p, q in bid_within) - sum(q for p, q in ask_within)) / max(sum(q for p, q in bid_within), 1) * 100,
+        "mid_price": float(price)
     }
     return res
 
-async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != USER_ID:
-        await update.message.reply_text("Нет доступа.")
-        return
-
-    stats = get_orderbook_stats()
+def make_message(stats, symbol="BTCUSDT"):
+    asset = symbol.replace("USDT", "")
     msg = (
-        f"📊 BTC/USDT Order Book (±0.5%)\n\n"
-        f"📉 Сопротивление: {stats['resistance']:.2f} $ ({stats['resistance_qty']:.2f} BTC)\n"
-        f"📊 Поддержка: {stats['support']:.2f} $ ({stats['support_qty']:.2f} BTC)\n"
+        f"📊 {asset}/USDT Order Book (±0.5%)\n\n"
+        f"💵 Цена: {stats['mid_price']:.2f} $\n"
+        f"📉 Сопротивление: {stats['resistance']:.2f} $ ({stats['resistance_qty']:.2f} {asset})\n"
+        f"📊 Поддержка: {stats['support']:.2f} $ ({stats['support_qty']:.2f} {asset})\n"
         f"📈 Диапазон: {stats['range_low']:.2f} — {stats['range_high']:.2f}\n"
         f"🟥 ask уровней: {stats['ask_lvls']} | 🟩 bid уровней: {stats['bid_lvls']}\n"
-        f"💰 Объём: 🔻 {stats['ask_vol']:.2f} BTC / ${stats['ask_usd']:.0f} | 🔺 {stats['bid_vol']:.2f} BTC / ${stats['bid_usd']:.0f}\n"
+        f"💰 Объём: 🔻 {stats['ask_vol']:.2f} {asset} / ${stats['ask_usd']:.0f} | 🔺 {stats['bid_vol']:.2f} {asset} / ${stats['bid_usd']:.0f}\n"
         f"🟢 {'Покупатели' if stats['side']=='Покупатели' else 'Продавцы'} доминируют на {int(stats['side_pct'])}%\n\n"
         "📌 Торговая идея:\n"
         "<pre>Параметр         | Значение\n"
@@ -72,9 +70,26 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_min=int(stats['resistance']),
         target_max=int(stats['resistance']+50),
     )
+    return msg
+
+async def btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != USER_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+    stats = get_orderbook_stats("BTCUSDT", PCT)
+    msg = make_message(stats, "BTCUSDT")
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+async def eth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != USER_ID:
+        await update.message.reply_text("Нет доступа.")
+        return
+    stats = get_orderbook_stats("ETHUSDT", PCT)
+    msg = make_message(stats, "ETHUSDT")
     await update.message.reply_text(msg, parse_mode="HTML")
 
 if __name__ == "__main__":
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("watch", watch))
+    app.add_handler(CommandHandler("btc", btc))
+    app.add_handler(CommandHandler("eth", eth))
     app.run_polling()
